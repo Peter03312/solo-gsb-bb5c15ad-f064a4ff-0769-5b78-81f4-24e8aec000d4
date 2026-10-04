@@ -112,7 +112,17 @@
   - **Cue 引用缺失**（Cue 引用的灯具在合并结果中不存在）；
   - **接线引用缺失**（接线指向的回路在合并结果中不存在）；
   - Cue/接线所依赖的灯具/回路在另一侧被删除时，被引用实体作为**联动冲突**一并列出，
-    需与引用方选择同一侧；随冲突灯具新增的接线等**附着项**自动跟随主体同侧。
+    需与引用方选择同一侧。
+- **同编号新增主体的依附项**：两组各自新增了**同一编号**的灯具/回路时（同编号新增异值），
+  待合入侧引用该编号的**新增 Cue**（或把既有灯具接线**改投**到该编号回路）不再被当作自动项——
+  它依附于「本组新增的那个实体」：
+  - 预览把这类 Cue/接线列为**依附冲突**（`attached: true`，原因 `attached_to_conflict`），
+    给出与冲突主体的结构化关系（`attachments` / `binding_note`）及选择每一侧后的结果；
+  - 依附项**本身另有冲突**（如 Cue 同编号异值、接线两侧异值）时不是纯依附项，必须逐项抉择；
+  - 提交时未显式抉择的纯依附项跟随所依附主体**同进同退**：保留草稿主体则待合入侧该新增
+    Cue/接线**不误合入**（不会挂到草稿的同编号实体上），采用待合入主体则正确随之合入；
+  - 依附项与主体**选择了不同侧** → `400` 整次拒绝（违规 `inconsistent_choice`）；
+  - 与冲突主体无关的单侧改动仍照常自动合入。
 - **预览不写库**：`POST /api/merge/preview` 只读比较并返回自动改动、冲突两侧值与一次性
   预览令牌（`token`）。
 - **提交规则**：`POST /api/merge/commit` 携带令牌与逐项 `resolutions`。
@@ -837,12 +847,38 @@ curl -X POST http://localhost:3000/api/merge/preview \
   "conflicts": [
     {
       "kind": "cue", "key": "cue:2", "id": 2, "title": "Cue #2",
+      "status": "conflict", "attached": false,
       "reason": "both_modified",
       "reason_text": "两侧相对共同基线做了不同修改",
       "reasons": [{"code": "both_modified", "side": null, "text": "两侧相对共同基线做了不同修改"}],
+      "attachments": {"draft": [], "incoming": []},
+      "binding_note": {"draft": null, "incoming": null},
       "base": { /* … */ },
       "draft": {"cue_no": 2, "light_id": 2, "light_name": "侧光L", "time": 2, "target": 80, "duration": 3},
       "incoming": {"cue_no": 2, "light_id": 2, "light_name": "侧光R", "time": 2, "target": 90, "duration": 1}
+    },
+    {
+      "kind": "cue", "key": "cue:7", "id": 7, "title": "Cue #7",
+      "status": "incoming_added", "attached": true,
+      "reason": "attached_to_conflict",
+      "reason_text": "随冲突主体一并新增的依附项，须与主体同进同退：待合入侧灯具 #9（待合入新灯）。选择某一侧主体后，本项跟随同侧；与主体不同侧的选择会整次拒绝",
+      "reasons": [ {"code": "attached_to_conflict", "side": null, "text": "…同上…"} ],
+      "edges": [ {"side": "incoming", "host_key": "light:9", "host_kind": "light", "host_id": 9} ],
+      "attachments": {
+        "draft": [],
+        "incoming": [
+          {"host_kind": "light", "host_id": 9, "host_key": "light:9",
+           "host_title": "灯具 #9（待合入新灯）",
+           "host_value": {"id": 9, "name": "待合入新灯"}}
+        ]
+      },
+      "binding_note": {
+        "draft": null,
+        "incoming": "若采用待合入版本：本项与 灯具 #9（待合入新灯） 同进同退（可交给系统跟随主体同侧）"
+      },
+      "base": null,
+      "draft": null,
+      "incoming": {"cue_no": 7, "light_id": 9, "light_name": "待合入新灯", "time": 3, "target": 40, "duration": 0}
     }
   ],
   "draft": { "lights": [], "circuits": [], "cues": [], "wiring": [] }
@@ -852,6 +888,12 @@ curl -X POST http://localhost:3000/api/merge/preview \
 条目类型 `kind`：`light`（灯具，按编号匹配名称）、`circuit`（回路，按编号匹配名称/容量）、
 `cue`（Cue，按 Cue 编号匹配灯具/时码/目标/渐变）、`wiring`（接线，按灯具编号匹配
 所属回路 `circuit_id`（`null`=未分配）与额定瓦数 `watts`）。
+
+冲突条目字段：`status` 为三方分类状态（`conflict` 表示本身存在结构性冲突）；`attached`
+为 `true` 表示该条目**本身无结构性冲突、纯因依附同编号新增主体而列入**（页面默认勾选
+「跟随冲突主体」，提交时可不在 `resolutions` 中列出）；`edges` / `attachments` 给出每一侧
+取值依附的主体（灯具/回路），`binding_note.draft`、`binding_note.incoming` 是对应中文说明。
+
 冲突原因 `reason`：
 
 | code | 含义 |
@@ -862,7 +904,8 @@ curl -X POST http://localhost:3000/api/merge/preview \
 | `name_collision` | 该侧取值会造成灯具/回路名称重名（`reasons[].side` 标明是哪一侧） |
 | `reference_missing` | 该侧取值下 Cue 引用的灯具、或接线引用的回路缺失 |
 | `reference_dependency` | 联动冲突：Cue/接线需要本灯具/回路，须与引用方同侧 |
-| `attached_to_conflict` | 随冲突主体新增的接线等，提交时自动跟随主体同侧 |
+| `attached_to_conflict` | 依附同编号新增主体的新增 Cue / 改投接线，须与主体同进同退（详情在 `attachments`） |
+| `inconsistent_choice` | 提交抉择中依附项与冲突主体落在不同侧（整次拒绝，仅出现在提交响应的 `violations`） |
 
 ### 2) 提交
 
@@ -953,6 +996,51 @@ curl -X POST http://localhost:3000/api/merge/commit \
 若抉择后的**最终**结果仍重名（例如把与现有灯同名的新增灯也选入），或某条 Cue/接线最终仍指向
 已删除的灯具/回路，提交依旧返回 `400` 整次拒绝、不写入；改用合法抉择后可凭**同一令牌**重试
 （令牌仅在成功提交、预览后草稿变动 409、或令牌过期/缺失时作废）。
+
+### 同编号新增灯具/回路：新增 Cue 与改投接线的依附抉择
+
+两组从同一基线**各自新增了相同编号**的灯具（或回路）时，引用该编号的新增 Cue / 接线属于
+**依附项**：它们必须与本组的同编号主体选择同一侧，不能再作为自动合入项挂到另一组的实体上。
+
+```bash
+# 场景：基线只有灯 #1、#2。草稿新增「#9 草稿新灯」（未配接线、无 Cue）；
+#       待合入版本 4 新增「#9 待合入新灯」，把它接到回路 #1（250W），并新增 Cue #7 指向灯 #9。
+# 预览：
+curl -X POST http://localhost:3000/api/merge/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"base_version_id":1,"incoming_version_id":4}'
+# → summary.conflicts_total 至少 3：
+#     light:9   same_key_diff  （同编号新增异值，主体）
+#     wiring:9  same_key_diff  （两侧新增接线异值：未分配 vs 回路#1/250W，本身有冲突须逐项抉择）
+#     cue:7     attached_to_conflict, attached:true（待合入单侧新增、依附 light:9，不再是 auto）
+#   cue:7 的 attachments.incoming = [{host_key:"light:9", host_title:"灯具 #9（待合入新灯）", …}]
+```
+
+```bash
+# 抉择 A：保留草稿主体（light:9=draft），wiring:9 保留草稿（未分配）；
+#         cue:7 是纯依附项、不在 resolutions 中 → 跟随主体，不引入（不会挂到草稿灯 #9）
+curl -X POST http://localhost:3000/api/merge/commit \
+  -H 'Content-Type: application/json' \
+  -d '{"token":"<token>","resolutions":{"light:9":"draft","wiring:9":"draft"}}'
+# → 200；草稿灯 #9 名称不变、仍未分配，Cue #7 不存在
+
+# 抉择 B：采用待合入主体（light:9=incoming，wiring:9=incoming）；cue:7 跟随合入
+curl -X POST http://localhost:3000/api/merge/commit \
+  -H 'Content-Type: application/json' \
+  -d '{"token":"<token>","resolutions":{"light:9":"incoming","wiring:9":"incoming"}}'
+# → 200；草稿灯 #9 改名「待合入新灯」、接到回路 #1（250W），新增 Cue #7 指向灯 #9
+
+# 抉择 C：主体保留草稿、却把依附 Cue 选为待合入 → 不一致，400 整次拒绝、草稿不变
+curl -X POST http://localhost:3000/api/merge/commit \
+  -H 'Content-Type: application/json' \
+  -d '{"token":"<token>","resolutions":{"light:9":"draft","wiring:9":"draft","cue:7":"incoming"}}'
+# → 400 {"violations":[{"key":"cue:7","code":"inconsistent_choice", …}], …}
+```
+
+同编号新增**回路**时，把既有灯具接线「改投」到该编号回路的情形同理：`wiring:<灯号>` 作为依附
+项跟随 `circuit:<编号>` 同进同退。依附项**自身两侧异值**（`status: "conflict"`、
+`attached: false`）时不自动跟随，必须像普通冲突一样逐项显式选择；与主体不同侧的组合按
+`inconsistent_choice` 整次拒绝。与该冲突主体无关的单侧新增/修改仍是 `auto`，照常自动合入。
 
 ## 共享房间 HTTP API
 

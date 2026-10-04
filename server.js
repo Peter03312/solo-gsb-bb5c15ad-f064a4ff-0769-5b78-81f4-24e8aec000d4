@@ -1089,8 +1089,15 @@ function entryTitle(c) {
   return `${c.label} #${c.id}`;
 }
 
-// 单条冲突原因的中文说明（name_collision / reference_missing 区分抉择侧）
-function describeReason(kind, id, r) {
+// 主体实体的中文称呼
+function hostLabelText(hostKind, hostId, ctx) {
+  const id = Number(hostId);
+  if (hostKind === 'light') return `灯具 #${id}${ctx ? `（${ctx.lightName(id)}）` : ''}`;
+  return `回路 #${id}${ctx ? `（${ctx.circuitName(id)}）` : ''}`;
+}
+
+// 单条冲突原因的中文说明（name_collision / reference_missing / 依附关系区分抉择侧）
+function describeReason(kind, id, r, ctx) {
   const sideText = r.side === 'draft' ? '保留草稿侧' : '采用待合入版本侧';
   switch (r.code) {
     case 'both_modified':
@@ -1113,17 +1120,43 @@ function describeReason(kind, id, r) {
       return `若${sideText2}，${who} 引用本${what}；请与该冲突选择同一侧（删除本项则该引用无法保留）`;
     }
     case 'attached_to_conflict': {
-      const hostLabel = r.detail.host_kind === 'light' ? `灯具 #${r.detail.host_id}` : `回路 #${r.detail.host_id}`;
-      return `随冲突项 ${hostLabel} 一并新增：选择是否引入该${hostLabel}时此项跟随同侧处理`;
+      const hosts = r.detail?.hosts;
+      if (Array.isArray(hosts) && hosts.length > 0) {
+        const parts = hosts.map(
+          (h) => `${h.side === 'draft' ? '草稿侧' : '待合入侧'}${hostLabelText(h.host_kind, h.host_id, ctx)}`
+        );
+        // 去重后列出
+        const uniq = [...new Set(parts)];
+        return `随冲突主体一并新增的依附项，须与主体同进同退：${uniq.join('；')}。选择某一侧主体后，本项跟随同侧；与主体不同侧的选择会整次拒绝`;
+      }
+      const hostLabel = hostLabelText(r.detail.host_kind, r.detail.host_id, ctx);
+      return `随冲突项 ${hostLabel} 一并新增：选择是否引入该主体时此项跟随同侧处理`;
+    }
+    case 'inconsistent_choice': {
+      const d = r.detail || {};
+      const ownSideText = d.side === 'draft' ? '草稿侧' : '待合入侧';
+      if (d.own_present === false) {
+        return `${ownSideText}此项不存在（随该侧删除/不引入），但另一侧的冲突主体 ${hostLabelText(
+          d.host_kind,
+          d.host_id,
+          ctx
+        )} 被保留，依附选择相互矛盾`;
+      }
+      const hostSideText = d.host_side === 'draft' ? '草稿侧' : d.host_side === 'incoming' ? '待合入侧' : '未定侧';
+      return `此项取${ownSideText}内容，但其依附的 ${hostLabelText(
+        d.host_kind,
+        d.host_id,
+        ctx
+      )} 最终落在${hostSideText}：同编号新增主体与其引用项必须选择同一侧，整次提交已拒绝`;
     }
     default:
       return r.code;
   }
 }
 
-function describeViolation(v) {
+function describeViolation(v, ctx) {
   const { kind, id } = Merge.parseKey(v.key);
-  return describeReason(kind, id, { code: v.code, detail: v.detail });
+  return describeReason(kind, id, { code: v.code, detail: v.detail }, ctx);
 }
 
 function presentAuto(e, ctx) {
@@ -1147,18 +1180,50 @@ function presentAuto(e, ctx) {
 }
 
 function presentConflict(c, ctx) {
+  // 结构化依附信息：每条依附边 → 主体展示值（带名称），按抉择侧分组
+  const attachments = { draft: [], incoming: [] };
+  for (const ed of c.edges || []) {
+    attachments[ed.side].push({
+      host_kind: ed.host_kind,
+      host_id: ed.host_id,
+      host_key: ed.host_key,
+      host_title: hostLabelText(ed.host_kind, ed.host_id, ctx),
+    });
+  }
+  // 从 attached_to_conflict 原因详情中取各侧主体取值（用于预览展示选择结果）
+  const attachedDetail = (c.reasons || []).find((r) => r.code === 'attached_to_conflict')?.detail;
+  for (const h of attachedDetail?.hosts || []) {
+    const slot = attachments[h.side].find(
+      (x) => x.host_key === h.host_key
+    );
+    if (slot) slot.host_value = enrichValue(h.host_kind, h.host_value, ctx);
+  }
+
+  // 每侧栏提示：该侧取值将随哪些冲突主体同进同退（attached 项的语义说明）
+  const bindingNote = (side) => {
+    const list = attachments[side];
+    if (list.length === 0) return null;
+    const titles = [...new Set(list.map((x) => x.host_title))];
+    return `若${side === 'draft' ? '保留草稿' : '采用待合入版本'}：本项与 ${titles.join('、')} 同进同退` +
+      (c.attached ? '（可交给系统跟随主体同侧）' : '（本项另有冲突，请与此处选择保持同侧，否则整次拒绝）');
+  };
+
   return {
     kind: c.kind,
     key: c.key,
     id: c.id,
+    status: c.status,
+    attached: !!c.attached,
     title: entryTitle(c),
     reason: c.reason,
-    reason_text: describeReason(c.kind, c.id, c.reasons[0]),
+    reason_text: describeReason(c.kind, c.id, c.reasons[0], ctx),
     reasons: c.reasons.map((r) => ({
       code: r.code,
       side: r.side || null,
-      text: describeReason(c.kind, c.id, r),
+      text: describeReason(c.kind, c.id, r, ctx),
     })),
+    attachments,
+    binding_note: { draft: bindingNote('draft'), incoming: bindingNote('incoming') },
     base: enrichValue(c.kind, c.base, ctx),
     draft: enrichValue(c.kind, c.draft, ctx),
     incoming: enrichValue(c.kind, c.incoming, ctx),
@@ -1269,13 +1334,16 @@ app.post('/api/merge/commit', (req, res) => {
       body.error = `仍有 ${result.unresolved.length} 个冲突未做选择，请逐项选择「保留草稿」或「采用待合入版本」后再提交`;
       body.unresolved = result.unresolved;
     } else if (result.violations.length > 0) {
-      body.error = '合并结果仍违反唯一性或引用规则，整次提交已拒绝：' +
-        result.violations.map(describeViolation).join('；');
+      const vctx = buildNameCtx(base, draftState, incoming);
+      const hasInconsistent = result.violations.some((v) => v.code === 'inconsistent_choice');
+      body.error = (hasInconsistent ? '依附项与冲突主体的选择不一致，' : '') +
+        '合并结果仍违反唯一性或引用规则，整次提交已拒绝：' +
+        result.violations.map((v) => describeViolation(v, vctx)).join('；');
       body.violations = result.violations.map((v) => ({
         key: v.key,
         code: v.code,
         detail: v.detail,
-        text: describeViolation(v),
+        text: describeViolation(v, vctx),
       }));
     }
     return res.status(400).json(body);

@@ -328,16 +328,66 @@ function classify(base, draft, incoming) {
     if (entryByKey.has(key)) conflictKeys.add(key);
   }
 
+  /*
+   * 依附边（attachment edges）：
+   * 两侧从基线【各自新增】的灯具/回路可能拿到相同编号（same_key_diff 或单侧新增
+   * 被规则提升为冲突）。引用该编号的 Cue / 接线按自身编号分类时看起来只是单侧新增，
+   * 但它语义上依附于「本侧的那个实体」：主体抉择另一侧后仍合入该项，改动就会挂到
+   * 另一组的实体上。故为 cue/wiring 条目逐侧建立依附边：
+   *   - cue S 侧值引用灯具 H（基线不存在、且 H 在冲突集合中）→ S 侧依附边；
+   *   - wiring S 侧值依附灯具 H（条目自身的灯），circuit_id 非空时再依附回路 H；
+   *   - 仅当条目两侧取值不等、主体两侧取值也不等时才有约束（任一两侧等价时，
+   *     选哪一侧结果都相同，无需耦合）；基线已存在的主体按稳定编号引用，跨侧组合
+   *     合法（删灯导致的悬空仍由最终引用校验拦截），不建边。
+   * 带依附边的非冲突条目降级为冲突（不再进 auto），跟随主体同侧抉择；
+   * 本身已是结构性冲突的条目只附上依附边，供逐项抉择时做同侧一致性校验。
+   */
+  function refsOf(kind, e, side) {
+    const v = side === 'draft' ? e.draft : e.incoming;
+    if (v === null) return [];
+    const refs = [];
+    if (kind === 'cue') refs.push({ host_kind: 'light', host_id: v.light_id });
+    if (kind === 'wiring') {
+      refs.push({ host_kind: 'light', host_id: e.id });
+      if (v.circuit_id !== null) refs.push({ host_kind: 'circuit', host_id: v.circuit_id });
+    }
+    return refs;
+  }
+
+  function bindingEdges(kind, e) {
+    const edges = [];
+    if (sameValue(e.draft, e.incoming)) return edges;
+    for (const side of ['draft', 'incoming']) {
+      const v = side === 'draft' ? e.draft : e.incoming;
+      if (v === null) continue;
+      for (const ref of refsOf(kind, e, side)) {
+        const hostKey = keyOf(ref.host_kind, ref.host_id);
+        if (!conflictKeys.has(hostKey)) continue;
+        const host = entryByKey.get(hostKey);
+        if (!host || host.base !== null) continue; // 仅约束基线不存在的新增主体
+        const hostValue = side === 'draft' ? host.draft : host.incoming;
+        if (hostValue === null) continue; // 该侧主体本就不存在，由引用缺失校验处理
+        if (sameValue(host.draft, host.incoming)) continue; // 主体两侧等价无需同侧
+        edges.push({ side, host_key: hostKey, ...ref });
+      }
+    }
+    return edges;
+  }
+
+  for (const kind of ['cue', 'wiring']) {
+    for (const e of maps[kind]) {
+      e.edges = bindingEdges(kind, e);
+      // 带依附边的非冲突条目：从 auto 降级为冲突，显式跟随主体同侧
+      if (e.edges.length > 0 && !conflictKeys.has(e.key)) conflictKeys.add(e.key);
+    }
+  }
+  // 灯具/回路不引用其他实体，不建边
+  for (const kind of ['light', 'circuit']) {
+    for (const e of maps[kind]) e.edges = [];
+  }
+
   const auto = [];
   const conflicts = [];
-
-  // 规则类冲突（重名/引用）涉及的实体：依附于它们的自动新增项（如同编号新增灯的接线）
-  // 不能自动生效——若该实体被抉择为不引入，自动项会悬空。降级为冲突，跟随主体抉择。
-  const ruleConflictKinds = new Map(); // key -> true（含规则类原因即标记）
-  for (const key of conflictKeys) {
-    const e = entryByKey.get(key);
-    if (e && e.status !== 'conflict') ruleConflictKinds.set(key, true);
-  }
 
   for (const kind of KINDS) {
     for (const e of maps[kind]) {
@@ -350,19 +400,31 @@ function classify(base, draft, incoming) {
       }
       for (const v of extraReasons.get(e.key) || []) reasons.push(v);
 
-      // 依附规则类冲突实体的自动新增项 → 降级为冲突（跟随主体取同侧）
-      if (
-        reasons.length === 0 &&
-        e.status === 'incoming_added' &&
-        ((kind === 'wiring' && ruleConflictKinds.has(keyOf('light', e.id))) ||
-          (kind === 'cue' && ruleConflictKinds.has(keyOf('light', e.incoming.light_id))))
-      ) {
-        const hostKind = kind === 'wiring' ? 'light' : 'light';
-        reasons.push({
+      // 依附降级条目：在原因中说明依附关系（结构性冲突条目只带依附边，不改主原因）
+      if (conflictKeys.has(e.key) && e.status !== 'conflict' && e.edges.length > 0) {
+        const hosts = [];
+        for (const side of ['draft', 'incoming']) {
+          for (const ed of e.edges.filter((x) => x.side === side)) {
+            const host = entryByKey.get(ed.host_key);
+            const hk = parseKey(ed.host_key);
+            hosts.push({
+              side,
+              host_kind: hk.kind,
+              host_id: ed.host_id,
+              host_key: ed.host_key,
+              host_value: (side === 'draft' ? host?.draft : host?.incoming) ?? null,
+            });
+          }
+        }
+        reasons.unshift({
           code: 'attached_to_conflict',
-          detail: { host_kind: hostKind, host_id: kind === 'wiring' ? e.id : e.incoming.light_id },
+          detail: {
+            // 兼容旧字段（单一主体时）
+            host_kind: hosts[0]?.host_kind,
+            host_id: hosts[0]?.host_id,
+            hosts,
+          },
         });
-        conflictKeys.add(e.key);
       }
 
       if (conflictKeys.has(e.key)) {
@@ -370,9 +432,13 @@ function classify(base, draft, incoming) {
           kind,
           key: e.key,
           id: e.id,
+          status: e.status,
           label: KIND_LABEL[kind],
           reason: reasons[0]?.code || e.reason,
           reasons,
+          edges: e.edges,
+          // 本身无结构性冲突、纯因依附主体而进入冲突列表 → 未显式抉择时可跟随主体
+          attached: e.status !== 'conflict',
           base: e.base,
           draft: e.draft,
           incoming: e.incoming,
@@ -448,27 +514,60 @@ function resolve(base, draft, incoming, resolutions = {}) {
     choice.set(key, side);
   }
 
+  // 未显式抉择的冲突按规则自动消解（不动点：依附跟随可能依赖其他主体先落定）：
+  //   - 两侧取值相同的规则类冲突：选哪一侧结果都一样，自动采用；
+  //   - 纯依附降级条目：唯一可行（全部已落定依附主体与该侧一致）的一侧跟随；
+  //     该侧无值（随主体删除/不引入）也视为一种可行结果。
   const unresolved = [];
-  for (const c of cls.conflicts) {
-    if (choice.has(c.key)) continue;
-    // 两侧取值相同的规则类冲突（如被重名牵连的同名灯、仅作联动提示的实体）：
-    // 选哪一侧结果都一样，自动采用，不要求显式抉择
-    if (c.status !== 'conflict' && sameValue(c.draft, c.incoming)) {
-      choice.set(c.key, 'draft');
-      continue;
-    }
-    // 附着冲突（随冲突主体新增的接线/Cue）：未显式抉择时跟随主体同侧
-    const attached = c.reasons.find((r) => r.code === 'attached_to_conflict');
-    if (attached) {
-      const hostKey = keyOf(attached.detail.host_kind, attached.detail.host_id);
-      const hostSide = choice.get(hostKey);
-      if (hostSide) {
-        choice.set(c.key, hostSide);
+  const pending = cls.conflicts.filter((c) => !choice.has(c.key));
+  let progressed = true;
+  while (progressed) {
+    progressed = false;
+    for (let idx = pending.length - 1; idx >= 0; idx--) {
+      const c = pending[idx];
+      if (c.status !== 'conflict' && sameValue(c.draft, c.incoming)) {
+        choice.set(c.key, 'draft');
+        pending.splice(idx, 1);
+        progressed = true;
         continue;
       }
+      if (!c.attached || c.edges.length === 0) continue;
+
+      // 一侧满足：该侧取值依附的全部新增主体都已落在该侧。
+      //  - 该侧无值（删除/不引入）：另一侧依附同编号的内容被保留则不满足；
+      //  - 该侧无依附边（仍引用基线实体/未分配）：视为满足（与新增主体无耦合）。
+      const satisfied = (side) => {
+        const own = side === 'draft' ? c.draft : c.incoming;
+        const sideEdges = c.edges.filter((ed) => ed.side === side);
+        if (own === null) {
+          return !c.edges.some((ed) => ed.side !== side && choice.get(ed.host_key) === ed.side);
+        }
+        return sideEdges.every((ed) => choice.get(ed.host_key) === side);
+      };
+      const edgeCount = (side) => c.edges.filter((ed) => ed.side === side).length;
+      const dSat = satisfied('draft');
+      const iSat = satisfied('incoming');
+      // 必须已有依附主体落定，才允许自动跟随（避免主体未选时抢跑）
+      const anyHostDecided = c.edges.some((ed) => choice.has(ed.host_key));
+      let followSide = null;
+      if (anyHostDecided && dSat && iSat) {
+        // 两侧都满足：优先跟随「有依附边」的一侧（无依附边一侧只是维持原状）
+        if (edgeCount('draft') > 0 && edgeCount('incoming') === 0) followSide = 'draft';
+        else if (edgeCount('incoming') > 0 && edgeCount('draft') === 0) followSide = 'incoming';
+        // 两侧都有边且都满足（多个主体分别落两侧）→ 留给用户逐项抉择
+      } else if (dSat && !iSat) {
+        followSide = 'draft';
+      } else if (iSat && !dSat) {
+        followSide = 'incoming';
+      }
+      if (followSide) {
+        choice.set(c.key, followSide);
+        pending.splice(idx, 1);
+        progressed = true;
+      }
     }
-    unresolved.push(c.key);
   }
+  for (const c of pending) unresolved.push(c.key);
 
   // 组装最终结果
   const out = {
@@ -496,6 +595,53 @@ function resolve(base, draft, incoming, resolutions = {}) {
   // 未全部抉择时不做最终校验，先提示逐项选择
   let violations = [];
   if (badResolutions.length === 0 && unresolved.length === 0) {
+    // 依附同侧一致性：条目最终取 S 侧内容时，其依附的新增主体也必须落在 S 侧。
+    // 不一致（如保留草稿主体却合入待合入侧新增、引用同编号的 Cue/接线）→ 整次拒绝。
+    for (const kind of KINDS) {
+      for (const e of cls.maps[kind]) {
+        if (!e.edges || e.edges.length === 0) continue;
+        const side = choice.get(e.key);
+        if (!side) continue;
+        const own = side === 'draft' ? e.draft : e.incoming;
+        if (own === null) {
+          // 该侧无值：不得有另一侧主体被保留下来还与本条目同编号绑定的情况
+          for (const ed of e.edges) {
+            if (ed.side !== side && choice.get(ed.host_key) === ed.side) {
+              violations.push({
+                key: e.key,
+                code: 'inconsistent_choice',
+                detail: {
+                  side,
+                  own_present: false,
+                  host_kind: ed.host_kind,
+                  host_id: ed.host_id,
+                  host_key: ed.host_key,
+                  host_side: ed.side,
+                },
+              });
+            }
+          }
+          continue;
+        }
+        for (const ed of e.edges) {
+          if (ed.side !== side) continue;
+          if (choice.get(ed.host_key) !== side) {
+            violations.push({
+              key: e.key,
+              code: 'inconsistent_choice',
+              detail: {
+                side,
+                own_present: true,
+                host_kind: ed.host_kind,
+                host_id: ed.host_id,
+                host_key: ed.host_key,
+                host_side: choice.get(ed.host_key) || null,
+              },
+            });
+          }
+        }
+      }
+    }
     const vv = validateResult(out.light, out.circuit, out.cue, out.wiring);
     for (const [key, list] of vv) {
       for (const v of list) violations.push({ key, code: v.code, detail: v.detail });

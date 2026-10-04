@@ -220,6 +220,12 @@ tr.cmp-hot td { color: var(--amber-soft); }
 }
 .merge-choice:hover { border-color: var(--amber); }
 .merge-choice.is-deleted { opacity: .75; }
+.merge-choice-follow {
+  border-style: solid;
+  border-color: var(--amber);
+  background: #201b12;
+}
+.merge-choice-follow .merge-choice-label { color: var(--amber); }
 .merge-choice input { margin-top: .25rem; }
 .merge-choice-label { font-weight: 600; color: var(--amber-soft); margin-bottom: .25rem; }
 .merge-warns { margin: .3rem 0 0; padding-left: 1.1rem; font-size: .8rem; }

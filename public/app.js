@@ -2241,24 +2241,45 @@ function renderMergePreview() {
   box.innerHTML = m.conflicts
     .map(
       (c, idx) => {
+        // 与抉择侧有关的警示（name_collision / reference_missing 等）
         const warn = (side) =>
           c.reasons
             .filter((r) => r.side === side)
             .map((r) => `<li class="danger-text">⚠ ${esc(r.text)}</li>`)
             .join('');
+        // 依附关系提示：本项取该侧时随哪些冲突主体同进同退
+        const binding = (side) => {
+          const note = c.binding_note && c.binding_note[side];
+          if (!note) return '';
+          const cls = c.attached ? 'muted' : 'danger-text';
+          return `<li class="${cls}">🔗 ${esc(note)}</li>`;
+        };
+        // 纯依附降级项：提供「跟随冲突主体」选项（未显式抉择时由系统按主体同侧落定）
+        const followChoice = c.attached
+          ? `
+          <label class="merge-choice merge-choice-follow">
+            <input type="radio" name="merge-choice-${idx}" value="follow" checked />
+            <div>
+              <div class="merge-choice-label">跟随冲突主体（推荐）</div>
+              <div class="merge-side muted">不单独抉择：按所依附的灯具/回路最终所选的一侧，自动同进同退。</div>
+            </div>
+          </label>`
+          : '';
         return `
-        <div class="merge-conflict" data-conflict-index="${idx}">
+        <div class="merge-conflict" data-conflict-index="${idx}" data-attached="${c.attached ? '1' : '0'}">
           <div class="merge-conflict-head">
             <b>${esc(c.title)}</b>
+            ${c.attached ? '<span class="badge waiting">依附项</span>' : ''}
             <span class="muted">${esc(c.reason_text)}</span>
           </div>
           <div class="merge-conflict-cols">
+            ${followChoice}
             <label class="merge-choice ${c.draft === null ? 'is-deleted' : ''}">
               <input type="radio" name="merge-choice-${idx}" value="draft" />
               <div>
                 <div class="merge-choice-label">保留草稿</div>
                 <div class="merge-side">${formatMergeValue(c.kind, c.draft)}</div>
-                <ul class="merge-warns">${warn('draft')}</ul>
+                <ul class="merge-warns">${binding('draft')}${warn('draft')}</ul>
               </div>
             </label>
             <label class="merge-choice ${c.incoming === null ? 'is-deleted' : ''}">
@@ -2266,7 +2287,7 @@ function renderMergePreview() {
               <div>
                 <div class="merge-choice-label">采用待合入版本</div>
                 <div class="merge-side">${formatMergeValue(c.kind, c.incoming)}</div>
-                <ul class="merge-warns">${warn('incoming')}</ul>
+                <ul class="merge-warns">${binding('incoming')}${warn('incoming')}</ul>
               </div>
             </label>
           </div>
@@ -2285,8 +2306,12 @@ $('btn-merge-commit').addEventListener('click', async () => {
   const unanswered = [];
   m.conflicts.forEach((c, idx) => {
     const picked = document.querySelector(`input[name="merge-choice-${idx}"]:checked`);
-    if (!picked) unanswered.push(c.title);
-    else resolutions[c.key] = picked.value;
+    if (!picked) {
+      unanswered.push(c.title);
+    } else if (picked.value === 'draft' || picked.value === 'incoming') {
+      // 纯依附项选「跟随」时不传抉择，由服务器按冲突主体同侧自动落定
+      resolutions[c.key] = picked.value;
+    }
   });
   if (unanswered.length > 0) {
     return showErr(
