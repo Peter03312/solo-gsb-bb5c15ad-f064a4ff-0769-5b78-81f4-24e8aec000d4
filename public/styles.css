@@ -223,6 +223,16 @@ tr.cmp-hot td { color: var(--amber-soft); }
 .merge-choice input { margin-top: .25rem; }
 .merge-choice-label { font-weight: 600; color: var(--amber-soft); margin-bottom: .25rem; }
 .merge-warns { margin: .3rem 0 0; padding-left: 1.1rem; font-size: .8rem; }
+.merge-attach-list {
+  margin: 0 0 .5rem;
+  padding: .4rem .6rem .4rem 1.6rem;
+  list-style: none;
+  font-size: .8rem;
+  border: 1px dashed var(--amber);
+  border-radius: 6px;
+  background: rgba(255, 193, 7, 0.08);
+}
+.merge-attach-list .merge-attach { margin: .15rem 0; }
 
 /* ------------------------------- 共享房间 ------------------------------ */
 .room-created {

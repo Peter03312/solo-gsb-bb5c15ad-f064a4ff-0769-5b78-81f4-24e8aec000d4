@@ -65,8 +65,11 @@ function wiringValue(row) {
 }
 
 // 三方快照统一成 kind -> Map(key -> 规范化值)。
-// 接线只对该侧存在的灯具有意义；快照中缺接线行的灯具按「未分配」补全，
-// 以免基线没有接线行（早期版本）被误判为改动。
+// 接线是稀疏的：灯具没有接线行、或接线为「未分配」（circuit_id=null），都归一为
+// 「未分配」并不放入 Map（取值 undefined）。这样：
+//   - 基线来自没有接线表的早期版本时，不会把全表误判为改动；
+//   - 同编号新增异值的灯若两侧都只是未分配，不会被凭空伪造出两侧不同的接线值；
+//   - 只有一侧真正分配了回路的接线，才作为单侧依附项跟随该侧主体。
 function normalizeSnapshots(base, draft, incoming) {
   const sides = [];
   for (const snap of [base, draft, incoming]) {
@@ -79,10 +82,10 @@ function normalizeSnapshots(base, draft, incoming) {
     for (const c of snap.circuits || []) circuits.set(c.id, circuitValue(c));
     for (const c of snap.cues || []) cues.set(c.cue_no, cueValue(c));
 
-    const rawWiring = new Map((snap.wiring || []).map((w) => [w.light_id, w]));
-    for (const id of lights.keys()) {
-      const w = rawWiring.get(id);
-      wiring.set(id, wiringValue(w ? w : { light_id: id, circuit_id: null, watts: null }));
+    for (const w of snap.wiring || []) {
+      if (w.circuit_id !== null && w.circuit_id !== undefined) {
+        wiring.set(w.light_id, wiringValue(w));
+      }
     }
 
     sides.push({ light: lights, circuit: circuits, cue: cues, wiring });
@@ -328,16 +331,86 @@ function classify(base, draft, incoming) {
     if (entryByKey.has(key)) conflictKeys.add(key);
   }
 
+  /*
+   * 同编号新增异值（same_key_diff）的主体与依附项耦合：
+   * 两侧从同一基线各自新增了同编号的不同灯具/回路，引用该编号的 Cue/接线是
+   * 「随哪一侧新增的实体而来」的依附项。它不属于自动项——主体最终保留哪一侧，
+   * 依附项才能挂到那一侧的实体上；主体被丢弃的一侧，其依附项必须一并丢弃。
+   *
+   * attachedByKey: key -> Map(hostKey -> 依附于该主体的侧别集合 'draft'|'incoming')
+   * 一条依附项可同时依附两侧（两侧都有取值）：
+   *   - 两侧取值相同 → 实质同一改动，默认随主体侧落定即可；
+   *   - 两侧取值不同 → 依附项自身也是冲突，必须逐项抉择；与主体选侧不一致则整次拒绝。
+   */
+  const attachedByKey = new Map();
+  const addAttachment = (depKey, hostKey, side) => {
+    if (!attachedByKey.has(depKey)) attachedByKey.set(depKey, new Map());
+    const hosts = attachedByKey.get(depKey);
+    if (!hosts.has(hostKey)) hosts.set(hostKey, new Set());
+    hosts.get(hostKey).add(side);
+  };
+
+  const sameKeyAddHosts = new Set();
+  for (const kind of KINDS) {
+    for (const e of maps[kind]) {
+      if (e.status === 'conflict' && e.reason === 'same_key_diff') {
+        sameKeyAddHosts.add(e.key);
+      }
+    }
+  }
+
+  // 主体集合：
+  //   sameKeyAddHosts —— 同编号新增异值的灯/回路（两侧各带一个不同实体，是本类缺陷的核心）；
+  //   conflictHosts   —— 任何进入冲突集合的灯/回路（重名、删除与修改并存、引用联动等）。
+  // 双侧依附只在「同编号新增异值」时成立（两侧实体不同，选侧才有挂错实体的风险）；
+  // 单侧依附（典型：待合入单侧新增的 Cue/接线引用了任一冲突主体）一律跟随主体，
+  // 不能当作自动项直接合入——主体最终被抉择为不引入时它会悬空或挂到别的编号上。
+  const conflictHosts = new Set();
+  for (const key of conflictKeys) {
+    const { kind } = parseKey(key);
+    if (kind === 'light' || kind === 'circuit') conflictHosts.add(key);
+  }
+
+  const isSideAdded = (entry, side) =>
+    !entry.base && (side === 'draft' ? !!entry.draft : !!entry.incoming);
+
+  const cueAttach = (e, side, v) => {
+    if (!v) return;
+    const host = keyOf('light', v.light_id);
+    if (
+      sameKeyAddHosts.has(host) ||
+      (conflictHosts.has(host) && isSideAdded(e, side))
+    ) {
+      addAttachment(e.key, host, side);
+    }
+  };
+  for (const e of maps.cue) {
+    cueAttach(e, 'draft', e.draft);
+    cueAttach(e, 'incoming', e.incoming);
+  }
+
+  const wiringAttach = (e, side, v) => {
+    if (!v) return; // 稀疏快照：无行/未分配均为 undefined，不构成依附
+    const lightHost = keyOf('light', e.id);
+    const sideAdded = isSideAdded(e, side);
+    // 稀疏快照中接线值恒指向具体回路（未分配不入 Map），它同时依附：
+    //   - 所属灯具（同编号新增异值灯恒登记；其他冲突灯仅单侧新增时跟随）；
+    //   - 所指向的同编号新增异值/冲突回路。
+    if (sameKeyAddHosts.has(lightHost) || (conflictHosts.has(lightHost) && sideAdded)) {
+      addAttachment(e.key, lightHost, side);
+    }
+    const circuitHost = keyOf('circuit', v.circuit_id);
+    if (sameKeyAddHosts.has(circuitHost) || (conflictHosts.has(circuitHost) && sideAdded)) {
+      addAttachment(e.key, circuitHost, side);
+    }
+  };
+  for (const e of maps.wiring) {
+    wiringAttach(e, 'draft', e.draft);
+    wiringAttach(e, 'incoming', e.incoming);
+  }
+
   const auto = [];
   const conflicts = [];
-
-  // 规则类冲突（重名/引用）涉及的实体：依附于它们的自动新增项（如同编号新增灯的接线）
-  // 不能自动生效——若该实体被抉择为不引入，自动项会悬空。降级为冲突，跟随主体抉择。
-  const ruleConflictKinds = new Map(); // key -> true（含规则类原因即标记）
-  for (const key of conflictKeys) {
-    const e = entryByKey.get(key);
-    if (e && e.status !== 'conflict') ruleConflictKinds.set(key, true);
-  }
 
   for (const kind of KINDS) {
     for (const e of maps[kind]) {
@@ -350,29 +423,50 @@ function classify(base, draft, incoming) {
       }
       for (const v of extraReasons.get(e.key) || []) reasons.push(v);
 
-      // 依附规则类冲突实体的自动新增项 → 降级为冲突（跟随主体取同侧）
-      if (
-        reasons.length === 0 &&
-        e.status === 'incoming_added' &&
-        ((kind === 'wiring' && ruleConflictKinds.has(keyOf('light', e.id))) ||
-          (kind === 'cue' && ruleConflictKinds.has(keyOf('light', e.incoming.light_id))))
-      ) {
-        const hostKind = kind === 'wiring' ? 'light' : 'light';
-        reasons.push({
-          code: 'attached_to_conflict',
-          detail: { host_kind: hostKind, host_id: kind === 'wiring' ? e.id : e.incoming.light_id },
-        });
+      // 依附于冲突主体的依附项：不能自动生效（主体若抉择为另一侧，本侧取值会悬空
+      // 或挂错实体）。非结构性冲突的条目一旦带有依附关系，补入依附原因并降级为冲突：
+      //   - 仅一侧有依附值（另一侧无值）→ 跟随该主体同侧落定，未显式抉择时自动跟随；
+      //   - 两侧都有依附值且相同 → 取哪侧结果都一样，默认随主体侧；
+      //   - 两侧都有依附值且不同 → 依附项自身冲突，必须逐项抉择，提交时校验与主体同侧。
+      const attachedHosts = attachedByKey.get(e.key);
+      if (attachedHosts && e.status !== 'conflict') {
+        for (const [hostKey, sides] of attachedHosts) {
+          const { kind: hostKind, id: hostId } = parseKey(hostKey);
+          reasons.push({
+            code: 'attached_to_conflict',
+            detail: {
+              host_kind: hostKind,
+              host_id: hostId,
+              sides: [...sides].sort(),
+            },
+          });
+        }
         conflictKeys.add(e.key);
       }
 
       if (conflictKeys.has(e.key)) {
+        const attached = attachedHosts
+          ? [...attachedHosts.entries()]
+              .map(([hostKey, sides]) => {
+                const { kind: hostKind, id: hostId } = parseKey(hostKey);
+                return {
+                  host_kind: hostKind,
+                  host_id: hostId,
+                  host_key: hostKey,
+                  sides: [...sides].sort(),
+                };
+              })
+              .sort((a, b) => (a.host_key < b.host_key ? -1 : 1))
+          : [];
         conflicts.push({
           kind,
           key: e.key,
           id: e.id,
           label: KIND_LABEL[kind],
+          status: e.status,
           reason: reasons[0]?.code || e.reason,
           reasons,
+          attached,
           base: e.base,
           draft: e.draft,
           incoming: e.incoming,
@@ -417,7 +511,7 @@ function classify(base, draft, incoming) {
     conflicts_total: conflicts.length,
   };
 
-  return { auto, conflicts, conflictKeys, summary, maps, entryByKey };
+  return { auto, conflicts, conflictKeys, summary, maps, entryByKey, attachedByKey };
 }
 
 /* ------------------------------ 抉择落地与校验 ------------------------------ */
@@ -457,14 +551,20 @@ function resolve(base, draft, incoming, resolutions = {}) {
       choice.set(c.key, 'draft');
       continue;
     }
-    // 附着冲突（随冲突主体新增的接线/Cue）：未显式抉择时跟随主体同侧
-    const attached = c.reasons.find((r) => r.code === 'attached_to_conflict');
-    if (attached) {
-      const hostKey = keyOf(attached.detail.host_kind, attached.detail.host_id);
-      const hostSide = choice.get(hostKey);
-      if (hostSide) {
-        choice.set(c.key, hostSide);
-        continue;
+    // 依附项自身没有冲突（仅因依附主体而降级）：未显式抉择时跟随【主体选侧】。
+    // 依附值只存在于另一侧时，主体选了本侧即意味该项随其主体一并丢弃（投影 null）；
+    // 依附项本身另有冲突（结构性冲突/规则违规）时不在此列，必须逐项抉择。
+    if (c.status !== 'conflict') {
+      const soleAttached =
+        c.attached.length === 1 && c.reasons.every((r) => r.code === 'attached_to_conflict')
+          ? c.attached[0]
+          : null;
+      if (soleAttached) {
+        const hostSide = choice.get(soleAttached.host_key);
+        if (hostSide) {
+          choice.set(c.key, hostSide);
+          continue;
+        }
       }
     }
     unresolved.push(c.key);
@@ -482,6 +582,7 @@ function resolve(base, draft, incoming, resolutions = {}) {
       let v;
       if (cls.conflictKeys.has(e.key)) {
         const side = choice.get(e.key);
+        // 依附项跟随主体选侧：该侧没有依附取值时 sideOutcome 返回 null（随主体丢弃）
         v = side === undefined ? undefined : sideOutcome(side, e.draft, e.incoming);
       } else {
         v = naturalOutcome(e.status, e.base, e.draft, e.incoming);
@@ -500,6 +601,27 @@ function resolve(base, draft, incoming, resolutions = {}) {
     for (const [key, list] of vv) {
       for (const v of list) violations.push({ key, code: v.code, detail: v.detail });
     }
+
+    // 依附一致性：依附项的最终选侧必须与其所依附的同编号新增异值主体同侧。
+    // 不一致（保留草稿主体却合入对方依附项，或反之）→ 整次拒绝，草稿不变。
+    for (const [depKey, hosts] of cls.attachedByKey) {
+      const depSide = choice.get(depKey);
+      if (!depSide) continue;
+      for (const [hostKey, sides] of hosts) {
+        // 该依附侧确实带有取值，才需要与主体同侧；依附侧无值时投影即随主体丢弃
+        if (sides.has(depSide) && choice.get(hostKey) !== depSide) {
+          violations.push({
+            key: depKey,
+            code: 'attachment_mismatch',
+            detail: {
+              side: depSide,
+              host_key: hostKey,
+              host_side: choice.get(hostKey),
+            },
+          });
+        }
+      }
+    }
   }
 
   const finalState = {
@@ -511,7 +633,15 @@ function resolve(base, draft, incoming, resolutions = {}) {
       }),
     circuits: [...out.circuit.values()].sort((a, b) => a.id - b.id),
     cues: [...out.cue.values()].sort((a, b) => a.cue_no - b.cue_no),
-    wiring: [...out.wiring.values()].sort((a, b) => a.light_id - b.light_id),
+    // 接线分类用稀疏表示（未分配不入表），落库结果仍对每盏留存灯稠密输出一行
+    wiring: [...out.light.values()]
+      .map((l) => {
+        const w = out.wiring.get(l.id);
+        return w
+          ? { light_id: l.id, circuit_id: w.circuit_id, watts: w.watts }
+          : { light_id: l.id, circuit_id: null, watts: null };
+      })
+      .sort((a, b) => a.light_id - b.light_id),
   };
 
   return {

@@ -2246,12 +2246,29 @@ function renderMergePreview() {
             .filter((r) => r.side === side)
             .map((r) => `<li class="danger-text">⚠ ${esc(r.text)}</li>`)
             .join('');
+        // 依附于同编号新增冲突主体（灯/回路）的 Cue/接线：展示关系；仅依附、自身无冲突
+        // 时主体选侧后自动联动；依附项自身也有冲突则仍须逐项抉择
+        const attachBanner = (c.attached || [])
+          .map((a) => {
+            const sideNames = a.sides
+              .map((s) => (s === 'draft' ? '草稿侧' : '待合入侧'))
+              .join('、');
+            const ownConflict = c.status === 'conflict';
+            const mode = ownConflict
+              ? '此项两侧内容也不同，须逐项选择且与主体保持同一侧（不一致将整次拒绝）'
+              : '此项随主体同侧处理（选择主体后自动联动，也可手动改选）';
+            return `<li class="merge-attach">🔗 依附冲突主体 <b>${esc(a.host_title)}</b>（${esc(
+              sideNames
+            )} 携带）：${esc(mode)}</li>`;
+          })
+          .join('');
         return `
         <div class="merge-conflict" data-conflict-index="${idx}">
           <div class="merge-conflict-head">
             <b>${esc(c.title)}</b>
             <span class="muted">${esc(c.reason_text)}</span>
           </div>
+          ${attachBanner ? `<ul class="merge-attach-list">${attachBanner}</ul>` : ''}
           <div class="merge-conflict-cols">
             <label class="merge-choice ${c.draft === null ? 'is-deleted' : ''}">
               <input type="radio" name="merge-choice-${idx}" value="draft" />
@@ -2274,6 +2291,25 @@ function renderMergePreview() {
       }
     )
     .join('');
+
+  // 仅依附型冲突（自身无冲突）：主体选定后自动勾选同一侧；依附项自身也有冲突时不联动
+  box.querySelectorAll('.merge-conflict').forEach((el, idx) => {
+    const c = m.conflicts[idx];
+    if (!c.attached || c.attached.length === 0 || c.status === 'conflict') return;
+    const hostKey = c.attached[0].host_key;
+    const hostIdx = m.conflicts.findIndex((x) => x.key === hostKey);
+    if (hostIdx < 0) return;
+    box.querySelectorAll(`input[name="merge-choice-${hostIdx}"]`).forEach((radio) => {
+      radio.addEventListener('change', () => {
+        if (radio.checked) {
+          const target = box.querySelector(
+            `input[name="merge-choice-${idx}"][value="${radio.value}"]`
+          );
+          if (target) target.checked = true;
+        }
+      });
+    });
+  });
 }
 
 $('btn-merge-commit').addEventListener('click', async () => {

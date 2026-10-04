@@ -1113,8 +1113,33 @@ function describeReason(kind, id, r) {
       return `若${sideText2}，${who} 引用本${what}；请与该冲突选择同一侧（删除本项则该引用无法保留）`;
     }
     case 'attached_to_conflict': {
-      const hostLabel = r.detail.host_kind === 'light' ? `灯具 #${r.detail.host_id}` : `回路 #${r.detail.host_id}`;
-      return `随冲突项 ${hostLabel} 一并新增：选择是否引入该${hostLabel}时此项跟随同侧处理`;
+      const hostLabel =
+        r.detail.host_kind === 'light'
+          ? `灯具 #${r.detail.host_id}`
+          : `回路 #${r.detail.host_id}`;
+      const hostNoun = r.detail.host_kind === 'light' ? '灯具' : '回路';
+      const depNoun = kind === 'cue' ? 'Cue' : '接线';
+      const sides = r.detail.sides || [];
+      if (r.side) {
+        const onThisSide = sides.includes(r.side);
+        if (onThisSide) {
+          return r.side === 'draft'
+            ? `草稿侧 ${hostLabel} 带此项：随「保留草稿」保留现状（草稿侧${depNoun}）`
+            : `待合入版本侧 ${hostLabel} 带此项：随「采用待合入版本」一并合入`;
+        }
+        return `本侧 ${hostLabel} 不携带此项：选择本侧后该${depNoun}不引入（不会挂到另一侧${hostNoun}上）`;
+      }
+      if (sides.length === 1) {
+        const only = sides[0] === 'draft' ? '草稿侧' : '待合入版本侧';
+        return `依附于同编号新增冲突主体 ${hostLabel}：仅${only}携带此项，跟随该${hostNoun}同侧落定，另一侧不引入`;
+      }
+      return `依附于同编号新增冲突主体 ${hostLabel}：两侧各带一项，须与该${hostNoun}选择同一侧，不一致将整次拒绝`;
+    }
+    case 'attachment_mismatch': {
+      const hk = r.detail.host_key || '';
+      const hostSideText = r.detail.host_side === 'draft' ? '保留草稿' : '采用待合入版本';
+      const depSideText = r.detail.side === 'draft' ? '保留草稿' : '采用待合入版本';
+      return `依附项选择「${depSideText}」与其冲突主体 ${hk} 的选择「${hostSideText}」不一致：依附项会挂到另一侧实体上，整次提交已拒绝（请改为同一侧）`;
     }
     default:
       return r.code;
@@ -1147,17 +1172,47 @@ function presentAuto(e, ctx) {
 }
 
 function presentConflict(c, ctx) {
+  // 依附原因按两侧选项各生成一条警示：携带侧说明选该侧会合入，非携带侧说明选该侧不引入，
+  // 让两个选项各自显示「选择后的结果」
+  const reasonRows = [];
+  for (const r of c.reasons) {
+    if (r.code === 'attached_to_conflict') {
+      const carrySides = new Set(r.detail.sides || []);
+      if (carrySides.size === 0) {
+        reasonRows.push({ code: r.code, side: null, text: describeReason(c.kind, c.id, r) });
+      } else {
+        for (const side of ['draft', 'incoming']) {
+          reasonRows.push({
+            code: r.code,
+            side,
+            text: describeReason(c.kind, c.id, {
+              ...r,
+              side,
+              detail: { ...r.detail, sides: [...carrySides] },
+            }),
+          });
+        }
+      }
+    } else {
+      reasonRows.push({ code: r.code, side: r.side || null, text: describeReason(c.kind, c.id, r) });
+    }
+  }
   return {
     kind: c.kind,
     key: c.key,
     id: c.id,
     title: entryTitle(c),
+    status: c.status || null,
     reason: c.reason,
     reason_text: describeReason(c.kind, c.id, c.reasons[0]),
-    reasons: c.reasons.map((r) => ({
-      code: r.code,
-      side: r.side || null,
-      text: describeReason(c.kind, c.id, r),
+    reasons: reasonRows,
+    attached: (c.attached || []).map((a) => ({
+      host_kind: a.host_kind,
+      host_id: a.host_id,
+      host_key: a.host_key,
+      host_title:
+        a.host_kind === 'light' ? `灯具 #${a.host_id}` : `回路 #${a.host_id}`,
+      sides: a.sides,
     })),
     base: enrichValue(c.kind, c.base, ctx),
     draft: enrichValue(c.kind, c.draft, ctx),

@@ -112,7 +112,16 @@
   - **Cue 引用缺失**（Cue 引用的灯具在合并结果中不存在）；
   - **接线引用缺失**（接线指向的回路在合并结果中不存在）；
   - Cue/接线所依赖的灯具/回路在另一侧被删除时，被引用实体作为**联动冲突**一并列出，
-    需与引用方选择同一侧；随冲突灯具新增的接线等**附着项**自动跟随主体同侧。
+    需与引用方选择同一侧；
+  - **依附冲突主体的新增 Cue/接线**（`attached_to_conflict`）：两组各自新增了同编号的
+    不同灯具/回路时，引用该编号的新增 Cue/接线**不是自动项**。预览在每个选项下显示
+    「选择后的结果」并给出与主体的依附关系（`attached`）：
+    - 仅一侧携带（典型：待合入侧新增 Cue/接线引用同编号新灯）→ 保留草稿主体时**不引入**
+      （不会挂到草稿侧同编号实体上），采用待合入主体时**随之合入**；提交未显式抉择时
+      自动跟随主体同侧；
+    - 两侧都携带且内容不同（如两盏同编号新灯各自接到不同回路）→ 依附项**自身也是冲突**，
+      必须逐项抉择，且与主体选侧不一致时整次拒绝；
+    - 依附项本身另有规则违规（如引用缺失、重名）时同样必须逐项抉择。
 - **预览不写库**：`POST /api/merge/preview` 只读比较并返回自动改动、冲突两侧值与一次性
   预览令牌（`token`）。
 - **提交规则**：`POST /api/merge/commit` 携带令牌与逐项 `resolutions`。
@@ -862,7 +871,8 @@ curl -X POST http://localhost:3000/api/merge/preview \
 | `name_collision` | 该侧取值会造成灯具/回路名称重名（`reasons[].side` 标明是哪一侧） |
 | `reference_missing` | 该侧取值下 Cue 引用的灯具、或接线引用的回路缺失 |
 | `reference_dependency` | 联动冲突：Cue/接线需要本灯具/回路，须与引用方同侧 |
-| `attached_to_conflict` | 随冲突主体新增的接线等，提交时自动跟随主体同侧 |
+| `attached_to_conflict` | 依附冲突主体（同编号新增异值的灯/回路等）的 Cue/接线；`attached` 给出主体与携带侧，仅依附时跟随主体，依附项自身异值时须逐项抉择 |
+| `attachment_mismatch` | 提交校验：依附项选侧与其冲突主体不一致（会挂到另一侧实体上），整次拒绝 |
 
 ### 2) 提交
 
@@ -929,6 +939,67 @@ curl -X POST http://localhost:3000/api/merge/commit \
   -H 'Content-Type: application/json' \
   -d '{"token":"<上一步返回的 token>","resolutions":{}}'
 ```
+
+### 同编号新增异值主体与依附 Cue/接线（本轮修复场景）
+
+两组从基线各自新增了**同编号的不同灯具（或回路）**时，引用该编号的新增 Cue/接线以前会被
+误列为自动项，保留草稿主体提交后会挂到草稿侧同编号实体上。现在预览把它们列为冲突，并在
+`attached` 中标明依附的主体与携带侧、在每个选项下给出选择后的结果。
+
+```bash
+# 基线 #1：灯1=面光1、灯2=侧光L；当前草稿新增灯 3「追光A」；
+# 待合入版本 2 新增另一盏灯 3「追光B」，并新增 Cue 3（引用灯3）、把灯3 接到回路1
+curl -X POST http://localhost:3000/api/merge/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"base_version_id":1,"incoming_version_id":2}'
+```
+
+返回（节选）：
+
+```json
+{
+  "summary": {"auto_total": 0, "conflicts_total": 3},
+  "conflicts": [
+    {"kind": "light", "key": "light:3", "reason": "same_key_diff",
+     "reason_text": "同编号新增但两侧内容不同", "attached": []},
+    {"kind": "cue", "key": "cue:3", "reason": "attached_to_conflict", "attached": [
+       {"host_kind": "light", "host_id": 3, "host_key": "light:3",
+        "host_title": "灯具 #3", "sides": ["incoming"]}],
+     "reasons": [
+       {"code": "attached_to_conflict", "side": "draft",
+        "text": "本侧 灯具 #3 不携带此项：选择本侧后该Cue不引入（不会挂到另一侧灯具上）"},
+       {"code": "attached_to_conflict", "side": "incoming",
+        "text": "待合入版本侧 灯具 #3 带此项：随「采用待合入版本」一并合入"}]},
+    {"kind": "wiring", "key": "wiring:3", "reason": "attached_to_conflict", "attached": [
+       {"host_kind": "light", "host_id": 3, "host_key": "light:3", "sides": ["incoming"]}]}
+  ]
+}
+```
+
+提交（沿用 `token`/`resolutions` 与 `draft`/`incoming` 取值；仅依附型项目可只选主体）：
+
+```bash
+# 保留草稿灯3：Cue3/接线3 自动跟随为「不引入」，不会挂到草稿的追光A
+curl -X POST http://localhost:3000/api/merge/commit \
+  -H 'Content-Type: application/json' \
+  -d '{"token":"<token>","resolutions":{"light:3":"draft"}}'
+# → 200：灯3=追光A；Cue3 不存在
+
+# 采用待合入灯3：Cue3/接线3 随之正确合入
+curl -X POST http://localhost:3000/api/merge/commit \
+  -H 'Content-Type: application/json' \
+  -d '{"token":"<重新预览的 token>","resolutions":{"light:3":"incoming"}}'
+# → 200：灯3=追光B、circuit_id=1、watts=400；Cue3.light_id=3
+
+# 主体保留草稿、却把依附 Cue 强选待合入 → 400 整次拒绝（violations 含 attachment_mismatch），草稿不变
+curl -X POST http://localhost:3000/api/merge/commit \
+  -H 'Content-Type: application/json' \
+  -d '{"token":"<token>","resolutions":{"light:3":"draft","cue:3":"incoming","wiring:3":"draft"}}'
+```
+
+两侧同编号新灯各自把它接到**不同回路**时，`wiring:3` 同时是 `same_key_diff` 结构性冲突，
+必须显式给出 `wiring:3` 的抉择；与 `light:3` 选侧不一致即整次拒绝。与本冲突无关的单侧新增
+（全新编号的灯具/回路/Cue/接线）仍照常出现在 `auto` 中自动合入。
 
 成功返回（节选，名称按编号互换、引用不漂移）：
 
@@ -1649,7 +1720,7 @@ curl -X POST http://localhost:3000/api/rooms/K7P2QX/schedule/cancel \
 server.js            Express 服务与 API、输入校验、版本快照事务、两版比对、临时调光记录（修订号/追加事务）、回路配置与负载分析、草稿三方合并（预览令牌/一次事务提交）、共享房间（房间码/控制密钥/服务端墙钟推算/末尾自动停住/控制修订号/回路超载保护：区间左边界自动暂停、超载拒绝播放与跳入、暂停避险、重启恢复）、循环排演（1～8 段编排提交/段尾跳回跳段的墙钟推算/轮次查询/暂停改速断点接续/手动跳转取消/超载段起点拒绝整次编排/运行中边界自动暂停/交接后延续）、讨论停点（整组校验原子替换/空组清除/连续经过准确暂停并显示原因/继续播放越过刚触发停点/循环每次重新经过仍暂停/段尾跳转不触发跳过停点/与超载边界取先抵达者且同时码超载优先）、定时启播（未来墙钟预约/同房间仅保留最近一次/取消、到点按绝对墙钟惰性启播与删除预约同一事务不重复启播、重启或迟到查询按预约时刻起算准确停在先遇到的停点/超载边界/末尾、断点启播含已完成编排从首段重来、不安全起点与播放中/非未来时刻拒绝、自动启播不加修订号、手动控制取消而交接保留、状态不泄露密钥）与主持权交接（一次性五分钟凭证：发起覆盖旧凭证、领取与修订号 +1 原子换发新密钥、主持人再控制即作废、过期/错误凭证与过期修订号明确拒绝、状态不泄露凭证与密钥）
 src/db.js            SQLite 初始化与表结构（含调光记录、操作序列、回路与版本回路快照表、合并预览令牌表、共享房间表（含超载保护启用与触发落库列、停点触发落库列、定时启播实际生效墙钟列）、主持权交接凭证表、循环排演编排行表、讨论停点表、定时启播预约表，含旧库迁移）
 src/backup.js        场地迁移备份/恢复 CLI：服务运行期间经 SQLite 在线备份 API 导出一致单文件（魔数+清单+SHA-256+库载荷，0600、原子写出、输出不回显密钥/凭证）；恢复对空目录先做校验和/完整性/结构兼容/引用关系四步校验再原子落地（非空或失败明确报错且目标不变），墙钟时刻与版本编号原值保留（node src/backup.js backup|restore）
-src/merge.js         草稿三方合并纯函数（按灯具/回路/Cue/接线分类自动项与冲突、重名与引用校验、抉择落地）
+src/merge.js         草稿三方合并纯函数（按灯具/回路/Cue/接线分类自动项与冲突、重名与引用校验、同编号新增异值主体与依附 Cue/接线的耦合判定、依附一致性校验、抉择落地）
 public/engine.js     纯函数灯光渐变引擎（浏览器/Node 共用，含线性渐变、中途接管、精确差值区间、覆盖/归还重算、回路负载二次精确求根）
 public/program.js    纯函数循环排演推进引擎（浏览器/Node 共用：段尾跳回本段起点/跳下段、多轮批量代数推算、超载边界命中冻结）
 public/index.html    单页界面（含版本合并页、共享房间页、循环排演编排卡、讨论停点卡、定时启播预约卡与主持权交接区）
@@ -1660,6 +1731,8 @@ test/compare.test.js 两版亮度差区间单元测试（交点精度、端点�
 test/override.test.js 覆盖/归还单元测试（渐变起点、同秒顺序、中途接管、0 秒立即生效、归还融合）
 test/circuit-load.test.js 回路负载单元测试（线性/二次超载求根、端点包含性、瞬变、多灯加权、未分配、零长度）
 test/merge.test.js   草稿三方合并单元测试（单侧自动合入、两侧异改/删除修改并存/同编号异值、重名、Cue/接线引用缺失、联动冲突、整次拒绝）
+test/merge-attach.test.js        同编号新增异值主体与依附 Cue/接线耦合的单元测试（依附不自动合入、跟随主体、逐项抉择、不一致整次拒绝）
+test/merge-attach-http.test.js   上述依附耦合的 HTTP 端到端回归（预览关系呈现、两种抉择落库、400/409、一次事务、版本与调光记录不变）
 test/room.test.js    共享房间 HTTP 单元测试（创建/加入/密钥鉴权、服务端墙钟推算、暂停固化、倍速、跳转、末尾自动停住、过期修订号 409、版本固定、重启恢复、非法参数报错）
 test/room-overload-protection.test.js 共享房间回路超载保护单元测试（创建开关与非布尔 400、旧版无配置、抵达区间左边界自动暂停不越界且不加修订号、当前超载拒绝播放、播放中跳入超载段拒绝且房间不变、暂停跳转避险、开端点精确求根、倍速实时推算、未启用沿用原行为、重启恢复触发状态）
 test/room-handover.test.js 主持权交接单元测试（发起鉴权与修订号校验、凭证仅显示一次与五分钟有效、同房间再发起覆盖旧凭证、领取与修订号 +1 原子完成、旧密钥即刻失效、并发领取至多一人成功、重试不回显新密钥、领取端过期修订号 409 可刷新重试、主持人再控制凭证作废 409、过期/错误/缺失凭证 403、交接不重置播放状态/时码/速度/固定版本/保护状态、GET 不泄露凭证与密钥）
